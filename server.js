@@ -6,61 +6,34 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-
-// Allow requests from any origin (Vercel frontend)
-app.use(cors({
-  origin: process.env.CLIENT_URL || "*",
-  credentials: true,
-}));
+app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json());
 
 app.use("/auth", require("./routes/auth"));
 app.use("/friends", require("./routes/friends"));
 
 app.get("/ice-config", require("./middleware/auth"), (req, res) => {
-  const iceServers = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-    // Free TURN from Open Relay Project (no signup needed)
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-  ];
-
-  // Override with paid TURN if configured
-  if (process.env.TURN_URL) {
-    iceServers.push({
-      urls: process.env.TURN_URL,
-      username: process.env.TURN_USERNAME,
-      credential: process.env.TURN_CREDENTIAL,
-    });
-  }
-
-  res.json({ iceServers });
+  res.json({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+    ]
+  });
 });
 
 app.get("/health", (req, res) =>
-  res.json({ status: "online", onlineUsers: presence.size, uptime: process.uptime() })
+  res.json({ status: "online", onlineUsers: presence.size })
 );
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: process.env.CLIENT_URL || "*", credentials: true },
+  cors: { origin: "*", credentials: true },
   pingTimeout: 60000,
   pingInterval: 25000,
 });
@@ -69,36 +42,32 @@ const io = new Server(server, {
 const presence = new Map();
 const rooms = new Map();
 
-// Socket auth
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error("No token"));
-  try {
-    socket.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    next(new Error("Invalid token"));
-  }
+  try { socket.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { next(new Error("Invalid token")); }
 });
 
 io.on("connection", (socket) => {
   const userId = Number(socket.user.id);
   const username = socket.user.username;
 
-  // Replace any existing connection for this user
+  // Always replace old socket with new one
   presence.set(userId, { socketId: socket.id, username });
-  console.log(`[+] ${username} connected. Online: ${presence.size}`);
+  console.log(`[+] ${username} (${userId}) online. Total: ${presence.size}`);
 
-  // Tell this new client all currently online user IDs
+  // Send ALL online user IDs to this new client immediately
   socket.emit("all-online-users", Array.from(presence.keys()));
 
   // Tell everyone else this user is online
   socket.broadcast.emit("user-online", { userId, username });
 
-  // ── Presence ────────────────────────────────────────────────────────────
+  // ── Presence: client sends friend IDs, server returns which are online ──
   socket.on("get-presence", (friendIds) => {
-    if (!Array.isArray(friendIds)) return;
+    if (!Array.isArray(friendIds) || friendIds.length === 0) return;
     const onlineIds = friendIds.map(Number).filter((id) => presence.has(id));
+    console.log(`[PRESENCE] ${username} asked ${friendIds.length} friends → ${onlineIds.length} online`);
     socket.emit("presence-list", onlineIds);
   });
 
@@ -109,6 +78,7 @@ io.on("connection", (socket) => {
     socket.emit("message-sent", { tempId, ts });
     if (target) {
       io.to(target.socketId).emit("direct-message", { fromUserId: userId, fromUsername: username, message, tempId, ts });
+      console.log(`[DM] ${username} → ${toUserId} ✓`);
     } else {
       socket.emit("message-offline", { tempId });
     }
@@ -139,8 +109,7 @@ io.on("connection", (socket) => {
   // ── WebRTC ───────────────────────────────────────────────────────────────
   socket.on("join-room", (roomId) => {
     if (socket.rooms.has(roomId)) {
-      const room = rooms.get(roomId) || [];
-      socket.emit("room-joined", { userCount: room.length, roomId });
+      socket.emit("room-joined", { userCount: (rooms.get(roomId) || []).length, roomId });
       return;
     }
     const room = rooms.get(roomId) || [];
@@ -163,7 +132,7 @@ io.on("connection", (socket) => {
     if (current?.socketId === socket.id) {
       presence.delete(userId);
       socket.broadcast.emit("user-offline", { userId });
-      console.log(`[-] ${username} disconnected. Online: ${presence.size}`);
+      console.log(`[-] ${username} offline. Total: ${presence.size}`);
     }
     const roomId = socket.data.roomId;
     if (roomId && rooms.has(roomId)) {
@@ -175,4 +144,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`\n🔐 SecureCall running on port ${PORT}\n`));
+server.listen(PORT, () => console.log(`\n🔐 SecureCall on port ${PORT}\n`));
